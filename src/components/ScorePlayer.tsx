@@ -13,7 +13,14 @@ interface NoteEvent {
   notes: Array<{ midi: number; durationInBeats: number }>;
 }
 
-type PlayerState = 'loading' | 'loadingAudio' | 'ready' | 'playing' | 'paused' | 'error';
+type PlayerState =
+  | 'loading'
+  | 'loadingAudio'
+  | 'ready'
+  | 'playing'
+  | 'paused'
+  | 'viewonly'
+  | 'error';
 
 interface ScorePlayerProps {
   scoreId: string;
@@ -29,6 +36,9 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
   // Playback data extracted from the score
   const cursorPositionsRef = useRef<CursorPosition[]>([]);
   const noteEventsRef = useRef<NoteEvent[]>([]);
+
+  // Graphical notes currently highlighted (so we can revert them)
+  const highlightedNotesRef = useRef<any[]>([]);
 
   // Playback runtime state (in refs to avoid stale closures)
   const isPlayingRef = useRef(false);
@@ -77,46 +87,73 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
         if (cancelled) return;
 
         osmd.render();
+        if (cancelled) return;
 
-        // Walk cursor to extract cursor positions and note events
+        // Walk the cursor to extract cursor positions and note events.
+        //
+        // Imported/OMR-converted scores (e.g. from the Audiveris PDF pipeline) can be
+        // structurally malformed in ways that make OSMD throw mid-walk — most commonly
+        // an unguarded Fraction comparison against an undefined timestamp, surfacing as
+        // "Cannot read properties of undefined (reading 'realValue')". Treat extraction
+        // as best-effort: if it fails, keep whatever we gathered and still show the
+        // rendered sheet as view-only instead of failing the whole player.
+        let extractionOk = true;
         const cursorPositions: CursorPosition[] = [];
-        const notesByTime = new Map<number, Set<string>>();  // dedup by time+midi key
         const noteEventMap = new Map<number, NoteEvent>();
 
-        // Walk linearly (ignore repeat signs) so timestamps match the visual layout
-        (osmd.EngravingRules as any).CursorIgnoreRepetitions = true;
+        try {
+          const notesByTime = new Map<number, Set<string>>();  // dedup by time+midi key
 
-        osmd.cursor.reset();
-        let stepIdx = 0;
+          // Walk linearly (ignore repeat signs) so timestamps match the visual layout
+          (osmd.EngravingRules as any).CursorIgnoreRepetitions = true;
 
-        while (!(osmd.cursor.iterator as any).endReached) {
-          // realValue is whole-note fractions (quarter note = 0.25); multiply by 4 → quarter beats
-          const timeInBeats: number = (osmd.cursor.iterator.currentTimeStamp as any).realValue * 4;
-          cursorPositions.push({ stepIdx, timeInBeats });
+          osmd.cursor.reset();
+          let stepIdx = 0;
 
-          const notes: any[] = osmd.cursor.NotesUnderCursor();
-          for (const note of notes) {
-            if (!note?.Pitch || note.isRest()) continue;
-            const midi = Math.max(0, Math.min(127, note.Pitch.halfTone + 12));
-            const dur = note.Length.RealValue * 4; // whole-note fractions → beats
-            const key = `${midi}`;
+          while (!(osmd.cursor.iterator as any).endReached) {
+            const ts = osmd.cursor.iterator.currentTimeStamp as any;
+            if (!ts) break; // malformed score: stop here, keep what we have
+            // RealValue is whole-note fractions (quarter note = 0.25); ×4 → quarter beats
+            const timeInBeats: number = ts.RealValue * 4;
+            cursorPositions.push({ stepIdx, timeInBeats });
 
-            if (!notesByTime.has(timeInBeats)) notesByTime.set(timeInBeats, new Set());
-            if (!notesByTime.get(timeInBeats)!.has(key)) {
-              notesByTime.get(timeInBeats)!.add(key);
-              if (!noteEventMap.has(timeInBeats)) {
-                noteEventMap.set(timeInBeats, { timeInBeats, notes: [] });
-              }
-              noteEventMap.get(timeInBeats)!.notes.push({ midi, durationInBeats: dur });
+            let notes: any[] = [];
+            try {
+              notes = osmd.cursor.NotesUnderCursor();
+            } catch {
+              notes = [];
             }
-          }
+            for (const note of notes) {
+              if (!note?.Pitch || note.isRest() || !note.Length) continue;
+              const midi = Math.max(0, Math.min(127, note.Pitch.halfTone + 12));
+              const dur = note.Length.RealValue * 4; // whole-note fractions → beats
+              const key = `${midi}`;
 
-          stepIdx++;
-          osmd.cursor.next();
+              if (!notesByTime.has(timeInBeats)) notesByTime.set(timeInBeats, new Set());
+              if (!notesByTime.get(timeInBeats)!.has(key)) {
+                notesByTime.get(timeInBeats)!.add(key);
+                if (!noteEventMap.has(timeInBeats)) {
+                  noteEventMap.set(timeInBeats, { timeInBeats, notes: [] });
+                }
+                noteEventMap.get(timeInBeats)!.notes.push({ midi, durationInBeats: dur });
+              }
+            }
+
+            stepIdx++;
+            osmd.cursor.next();
+          }
+        } catch (walkErr) {
+          // OSMD choked on this score's internal structure — fall back to view-only.
+          console.warn('Playback extraction failed; showing score as view-only.', walkErr);
+          extractionOk = false;
         }
 
-        osmd.cursor.reset();
-        osmd.cursor.show();
+        try {
+          osmd.cursor.reset();
+          osmd.cursor.show();
+        } catch {
+          /* cursor may be unusable on a malformed score; ignore */
+        }
 
         const noteEvents = Array.from(noteEventMap.values()).sort(
           (a, b) => a.timeInBeats - b.timeInBeats
@@ -127,6 +164,13 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
 
         const maxBeat = cursorPositions.at(-1)?.timeInBeats ?? 0;
         setTotalBeats(maxBeat);
+
+        // Nothing playable (extraction failed, or the score has no pitched notes) →
+        // skip audio setup and present the rendered sheet as view-only.
+        if (!extractionOk || noteEvents.length === 0) {
+          if (!cancelled) setState('viewonly');
+          return;
+        }
 
         if (cancelled) return;
         setState('loadingAudio');
@@ -157,6 +201,44 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
       audioCtxRef.current?.close();
     };
   }, [scoreId]);
+
+  // ─── Note highlighting ───────────────────────────────────────────────────────
+
+  const HIGHLIGHT_COLOR = '#e11d48'; // rose-600
+  const DEFAULT_COLOR = '#000000';
+  const COLOR_OPTS = { applyToStem: true, applyToBeams: true } as const;
+
+  const clearHighlights = useCallback(() => {
+    for (const gn of highlightedNotesRef.current) {
+      try {
+        gn.setColor(DEFAULT_COLOR, COLOR_OPTS);
+      } catch {
+        /* note may no longer be in the DOM after a re-render */
+      }
+    }
+    highlightedNotesRef.current = [];
+  }, []);
+
+  // Revert the previously highlighted notes and color the notes under the cursor.
+  const highlightCurrentNotes = useCallback(() => {
+    const osmd = osmdRef.current;
+    if (!osmd) return;
+    clearHighlights();
+    let gnotes: any[] = [];
+    try {
+      gnotes = osmd.cursor.GNotesUnderCursor() ?? [];
+    } catch {
+      gnotes = [];
+    }
+    for (const gn of gnotes) {
+      try {
+        gn.setColor(HIGHLIGHT_COLOR, COLOR_OPTS);
+        highlightedNotesRef.current.push(gn);
+      } catch {
+        /* ignore notes that can't be colored (e.g. rests) */
+      }
+    }
+  }, [clearHighlights]);
 
   // ─── Animation / scheduling loop ────────────────────────────────────────────
 
@@ -196,13 +278,16 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
 
     // Advance visual cursor
     const positions = cursorPositionsRef.current;
+    let advanced = false;
     while (
       cursorStepRef.current < positions.length - 1 &&
       positions[cursorStepRef.current + 1].timeInBeats <= currentBeat + 0.01
     ) {
       osmd?.cursor.next();
       cursorStepRef.current++;
+      advanced = true;
     }
+    if (advanced) highlightCurrentNotes();
 
     // Detect end of score
     const lastNoteTime = noteEventsRef.current.at(-1)?.timeInBeats ?? 0;
@@ -212,6 +297,7 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
     if (now > lastAudioTime + 2.5) {
       isPlayingRef.current = false;
       setState('ready');
+      clearHighlights();
       osmd?.cursor.reset();
       osmd?.cursor.show();
       cursorStepRef.current = 0;
@@ -222,7 +308,7 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
     }
 
     animFrameRef.current = requestAnimationFrame(animate);
-  }, []);
+  }, [clearHighlights, highlightCurrentNotes]);
 
   // ─── Controls ───────────────────────────────────────────────────────────────
 
@@ -244,6 +330,7 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
     cancelAnimationFrame(animFrameRef.current);
     osmdRef.current?.cursor.reset();
     osmdRef.current?.cursor.show();
+    highlightCurrentNotes();
     cursorStepRef.current = 0;
     scheduleIdxRef.current = 0;
     currentBeatRef.current = 0;
@@ -255,7 +342,7 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
     isPlayingRef.current = true;
     setState('playing');
     animFrameRef.current = requestAnimationFrame(animate);
-  }, [state, animate]);
+  }, [state, animate, highlightCurrentNotes]);
 
   const handlePause = useCallback(async () => {
     cancelAnimationFrame(animFrameRef.current);
@@ -268,6 +355,7 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
     cancelAnimationFrame(animFrameRef.current);
     isPlayingRef.current = false;
     await audioCtxRef.current?.suspend();
+    clearHighlights();
     osmdRef.current?.cursor.reset();
     osmdRef.current?.cursor.show();
     cursorStepRef.current = 0;
@@ -276,7 +364,7 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
     startBeatRef.current = 0;
     setDisplayBeat(0);
     setState('ready');
-  }, []);
+  }, [clearHighlights]);
 
   const progress = totalBeats > 0 ? Math.min(displayBeat / totalBeats, 1) : 0;
   const isReady = state === 'ready' || state === 'playing' || state === 'paused';
@@ -361,6 +449,14 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
             />
             <span className="w-8 text-right tabular-nums">{bpm}</span>
           </div>
+        </div>
+      )}
+
+      {/* View-only notice (score rendered, but playback couldn't be derived) */}
+      {state === 'viewonly' && (
+        <div className="sticky bottom-0 border-t border-amber-200 bg-amber-50 text-amber-800 text-sm px-6 py-3 text-center">
+          Automatic playback isn’t available for this score — its notation couldn’t be
+          parsed into notes (common with PDF-converted scores). You can still view it.
         </div>
       )}
     </div>
