@@ -71,8 +71,11 @@ export default function ScorePlayer({ scoreId }: ScorePlayerProps) {
         const osmd = new OpenSheetMusicDisplay(containerRef.current!, {
           autoResize: true,
           backend: 'svg',
-          drawTitle: true,
-          drawSubtitle: true,
+          // The page header already shows the score title; suppress OSMD's
+          // in-score title/subtitle (it draws a default "Untitled Score"
+          // placeholder for OMR output that has no <work-title>).
+          drawTitle: false,
+          drawSubtitle: false,
           followCursor: true,
           cursorsOptions: [{ type: 0, color: '#3b82f6', alpha: 0.5, follow: true }],
         });
