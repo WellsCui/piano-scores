@@ -24,3 +24,14 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* OSMD renders SVG into this container — let it fill width */
+.osmd-container {
+  width: 100%;
+  background: white;
+}
+
+.osmd-container svg {
+  width: 100% !important;
+  height: auto;
+}

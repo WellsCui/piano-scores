@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Audiveris binary (install via: npm run setup-audiveris)
+/bin/audiveris/
+
+# Score data
+/data/
