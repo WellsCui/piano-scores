@@ -28,13 +28,12 @@ export async function extractMxl(buf: Buffer): Promise<string> {
 
 /**
  * Cheap structural summary of a MusicXML document, for diagnostics/logging.
- * `divisions` is the set of distinct resolutions found — more than one is the
- * pattern that trips OpenSheetMusicDisplay (see `normalizeMusicXmlDivisions`).
  */
 export function summarizeMusicXml(xml: string): {
   divisions: number[];
   parts: number;
   measures: number;
+  octaveShifts: { up: number; down: number; stop: number; continue: number };
 } {
   const divisions = [
     ...new Set(
@@ -43,64 +42,86 @@ export function summarizeMusicXml(xml: string): {
   ];
   const parts = (xml.match(/<part\s+id=/g) || []).length;
   const measures = (xml.match(/<measure\b/g) || []).length;
-  return { divisions, parts, measures };
+  const types = [...xml.matchAll(/<octave-shift\b[^>]*\btype="([^"]+)"/g)].map((m) => m[1]);
+  const octaveShifts = {
+    up: types.filter((t) => t === 'up').length,
+    down: types.filter((t) => t === 'down').length,
+    stop: types.filter((t) => t === 'stop').length,
+    continue: types.filter((t) => t === 'continue').length,
+  };
+  return { divisions, parts, measures, octaveShifts };
 }
 
-const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
-const lcm = (a: number, b: number): number => (a / gcd(a, b)) * b;
-
 /**
- * Normalize a MusicXML document to a single `<divisions>` value per the whole
- * score.
+ * Repair MusicXML so OpenSheetMusicDisplay 2.0.0 can render it.
  *
- * Audiveris (and other OMR/import tools) sometimes emit different `<divisions>`
- * resolutions in different measures of the same part. That's legal MusicXML, but
- * OpenSheetMusicDisplay 2.0.0 mishandles it — its unguarded `Fraction`
- * comparisons throw "Cannot read properties of undefined (reading 'realValue')"
- * while building the sheet, which fails the whole player.
+ * OMR/PDF-converted scores (e.g. from Audiveris) sometimes emit an
+ * `<octave-shift>` bracket that never balances — a `up`/`down` start with no
+ * matching `stop`, or a `stop`/`continue` with no open start. OSMD's render
+ * pass (`calculateOctaveShifts` → `calculateSingleOctaveShift`) then compares
+ * against an unresolved end timestamp via `Fraction.lte`, reads `.realValue`
+ * off `undefined`, and throws "Cannot read properties of undefined (reading
+ * 'realValue')", failing the entire render.
  *
- * The fix is pure arithmetic and lossless: pick the least common multiple of all
- * `<divisions>` values as the target, then rescale every duration-valued element
- * (`<duration>` in notes/backup/forward, and `<offset>`) by `target / divisions`
- * for the resolution in effect at that point in the document. Because the target
- * is a multiple of every source resolution, all values stay integers.
+ * Fix: pair octave-shift directions per part and per `number` channel, then drop
+ * the `<direction>` blocks of any that don't balance. Well-formed pairs survive
+ * (so valid 8va/8vb brackets are preserved); clean scores return unchanged.
  *
- * Returns the original string untouched (`changed: false`) when the score already
- * uses a single resolution, so well-formed files pay nothing.
+ * (Mixed `<divisions>` resolutions across measures are also common in this
+ * output but render fine — they are NOT the cause and are left untouched.)
  */
-export function normalizeMusicXmlDivisions(xml: string): { xml: string; changed: boolean } {
-  const divisions = [...xml.matchAll(/<divisions>\s*(\d+)\s*<\/divisions>/g)].map((m) =>
-    parseInt(m[1], 10)
-  );
-  const distinct = [...new Set(divisions)].filter((d) => d > 0);
-  if (distinct.length <= 1) return { xml, changed: false };
+export function repairMusicXmlForOsmd(xml: string): {
+  xml: string;
+  changed: boolean;
+  removedOctaveShifts: number;
+} {
+  const blocks: { start: number; end: number; type: string; number: string }[] = [];
+  for (const m of xml.matchAll(/<direction\b[^>]*>[\s\S]*?<\/direction>/g)) {
+    const os = m[0].match(/<octave-shift\b[^>]*>/);
+    if (!os) continue;
+    const type = os[0].match(/\btype="([^"]+)"/)?.[1] ?? '';
+    const number = os[0].match(/\bnumber="([^"]+)"/)?.[1] ?? '1';
+    const start = m.index ?? 0;
+    blocks.push({ start, end: start + m[0].length, type, number });
+  }
+  if (blocks.length === 0) return { xml, changed: false, removedOctaveShifts: 0 };
 
-  const target = distinct.reduce((a, b) => lcm(a, b));
+  // Octave-shift start/stop matching is scoped to a part and a `number` channel.
+  const partStarts = [...xml.matchAll(/<part\s+id=/g)].map((m) => m.index ?? 0);
+  const partOf = (off: number) => {
+    let p = 0;
+    for (const s of partStarts) {
+      if (s <= off) p = s;
+      else break;
+    }
+    return p;
+  };
 
-  // Single forward pass. `current` is the divisions resolution in effect at the
-  // current point in the document; it resets at each new part and updates on
-  // every `<divisions>` element (MusicXML guarantees divisions are declared
-  // before any duration that depends on them).
-  let current = 0;
-  const tokenRe =
-    /<part\s+[^>]*>|<divisions>\s*(\d+)\s*<\/divisions>|<duration>\s*(\d+)\s*<\/duration>|<offset>\s*(-?\d+)\s*<\/offset>/g;
-
-  const out = xml.replace(tokenRe, (full, div?: string, dur?: string, off?: string) => {
-    if (div !== undefined) {
-      current = parseInt(div, 10);
-      return `<divisions>${target}</divisions>`;
+  const openStacks = new Map<string, number[]>(); // `${part}|${number}` -> open start indices
+  const unbalanced = new Set<number>();
+  blocks.forEach((b, i) => {
+    const key = `${partOf(b.start)}|${b.number}`;
+    let stack = openStacks.get(key);
+    if (!stack) {
+      stack = [];
+      openStacks.set(key, stack);
     }
-    if (!current) return full; // before any divisions (or unknown part) — leave as-is
-    if (dur !== undefined) {
-      return `<duration>${(parseInt(dur, 10) * target) / current}</duration>`;
+    if (b.type === 'up' || b.type === 'down') {
+      stack.push(i);
+    } else if (b.type === 'stop') {
+      if (stack.length) stack.pop();
+      else unbalanced.add(i); // stop with no open start
+    } else if (stack.length === 0) {
+      unbalanced.add(i); // continue with no open start
     }
-    if (off !== undefined) {
-      return `<offset>${(parseInt(off, 10) * target) / current}</offset>`;
-    }
-    // body <part ...> open tag — reset resolution for the new part
-    current = 0;
-    return full;
   });
+  for (const stack of openStacks.values()) for (const i of stack) unbalanced.add(i); // never stopped
 
-  return { xml: out, changed: true };
+  if (unbalanced.size === 0) return { xml, changed: false, removedOctaveShifts: 0 };
+
+  // Remove the offending <direction> blocks back-to-front so offsets stay valid.
+  const removals = [...unbalanced].map((i) => blocks[i]).sort((a, b) => b.start - a.start);
+  let out = xml;
+  for (const b of removals) out = out.slice(0, b.start) + out.slice(b.end);
+  return { xml: out, changed: true, removedOctaveShifts: unbalanced.size };
 }

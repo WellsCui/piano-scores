@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import { getScoreFilePath, getScore } from '@/lib/scores';
-import { extractMxl, normalizeMusicXmlDivisions } from '@/lib/musicxml';
+import { extractMxl, repairMusicXmlForOsmd } from '@/lib/musicxml';
 
 export async function GET(
   _request: NextRequest,
@@ -16,14 +16,15 @@ export async function GET(
   const content = fs.readFileSync(filePath);
   const isMxl = score.filename.endsWith('.mxl');
 
-  // Normalize mixed-resolution MusicXML (common in OMR/PDF-converted scores) so
-  // OpenSheetMusicDisplay can render it. When normalization is needed we serve
-  // the uncompressed, corrected XML; otherwise the original file is served as-is.
+  // Repair MusicXML that OpenSheetMusicDisplay can't render (common in OMR/
+  // PDF-converted scores — e.g. an unbalanced <octave-shift> crashes its render
+  // pass). When a repair is applied we serve the uncompressed, corrected XML;
+  // otherwise the original file is served as-is.
   try {
     const xml = isMxl ? await extractMxl(content) : content.toString('utf-8');
-    const { xml: normalized, changed } = normalizeMusicXmlDivisions(xml);
+    const { xml: repaired, changed } = repairMusicXmlForOsmd(xml);
     if (changed) {
-      return new NextResponse(normalized, {
+      return new NextResponse(repaired, {
         headers: { 'Content-Type': 'application/xml' },
       });
     }

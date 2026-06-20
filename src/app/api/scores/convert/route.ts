@@ -5,7 +5,7 @@ import path from 'path';
 import os from 'os';
 import { convertPdfToMusicXml, isAudiverisInstalled } from '@/lib/audiveris';
 import { addScore, extractXmlMetadata } from '@/lib/scores';
-import { extractMxl, normalizeMusicXmlDivisions, summarizeMusicXml } from '@/lib/musicxml';
+import { extractMxl, repairMusicXmlForOsmd, summarizeMusicXml } from '@/lib/musicxml';
 import { createLogger } from '@/lib/log';
 
 // PDF conversion can take up to 5 minutes for complex scores
@@ -46,19 +46,22 @@ export async function POST(request: NextRequest) {
 
     const { content, ext } = await convertPdfToMusicXml(pdfPath);
 
-    // Diagnostic snapshot of the converted output: mixed `<divisions>` is the
-    // structure that breaks OSMD, so capture it for future investigation.
+    // Diagnostic snapshot of the converted output. Unbalanced <octave-shift>
+    // directions are the structure that breaks OSMD's render, so capture the
+    // octave-shift breakdown and what the serve-time repair will do.
     try {
       const xml = ext === 'mxl' ? await extractMxl(content) : content.toString('utf-8');
       const summary = summarizeMusicXml(xml);
+      const repair = repairMusicXmlForOsmd(xml);
       log.info('converted MusicXML analysis', {
         ext,
         contentBytes: content.length,
         divisions: summary.divisions,
-        mixedDivisions: summary.divisions.length > 1,
         parts: summary.parts,
         measures: summary.measures,
-        willNormalizeOnServe: normalizeMusicXmlDivisions(xml).changed,
+        octaveShifts: summary.octaveShifts,
+        willRepairOnServe: repair.changed,
+        removedOctaveShifts: repair.removedOctaveShifts,
       });
     } catch (analysisErr: unknown) {
       log.warn('could not analyze converted output', {
